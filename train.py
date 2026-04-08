@@ -2,6 +2,7 @@ import numpy as np
 import os
 from datetime import datetime
 from configs.go2_constraint_him import Go2ConstraintHimRoughCfg, Go2ConstraintHimRoughCfgPPO
+from configs.m2_config import M2ConstraintHimRoughCfg, M2ConstraintHimRoughCfgPPO
 
 
 import isaacgym
@@ -16,6 +17,7 @@ def train(args):
 
 if __name__ == '__main__':
     task_registry.register("go2N3poHim",LeggedRobot,Go2ConstraintHimRoughCfg(),Go2ConstraintHimRoughCfgPPO())
+    task_registry.register("m2",LeggedRobot,M2ConstraintHimRoughCfg(),M2ConstraintHimRoughCfgPPO())
   
     args = get_args()
     train(args)

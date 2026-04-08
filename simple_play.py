@@ -1,8 +1,9 @@
 from configs.go2_constraint_him import Go2ConstraintHimRoughCfg, Go2ConstraintHimRoughCfgPPO
+from configs.m2_config import M2ConstraintHimRoughCfg, M2ConstraintHimRoughCfgPPO
 import cv2
 import os
 
-from isaacgym import gymapi
+from isaacgym import gymapi, gymtorch
 from envs import LeggedRobot
 from modules import *
 from utils import  get_args, export_policy_as_jit, task_registry, Logger
@@ -29,7 +30,7 @@ def delete_files_in_directory(directory_path):
 def play(args):
     env_cfg, train_cfg = task_registry.get_cfgs(name=args.task)
     # override some parameters for testing
-    env_cfg.env.num_envs = min(env_cfg.env.num_envs, 1)
+    env_cfg.env.num_envs = min(env_cfg.env.num_envs, 100)
     env_cfg.terrain.num_rows = 5
     env_cfg.terrain.num_cols = 5
     env_cfg.terrain.curriculum = False
@@ -47,8 +48,21 @@ def play(args):
     env_cfg.control.use_filter = True
     env_cfg.domain_rand.disturbance = False
     env_cfg.domain_rand.randomize_kpkd = False
+
     # prepare environment
     env, _ = task_registry.make_env(name=args.task, args=args, env_cfg=env_cfg)
+
+
+    # >>>>>>> 写死初始根状态 <<<<<<<
+    env_ids = torch.arange(env.num_envs, device=env.device)
+    env.root_states[env_ids, :3]  = env.env_origins[env_ids] + \
+                                    torch.tensor([0.0, 0.0, 0.45], device=env.device)  # x,y,z
+    env.root_states[env_ids, 3:7]  = torch.tensor([0., 0., 0., 1.], device=env.device)  # 四元数
+    env.root_states[env_ids, 7:10] = 0.5  # 线速度
+    env.root_states[env_ids, 10:13]= 0.  # 角速度
+    env.gym.set_actor_root_state_tensor(env.sim, gymtorch.unwrap_tensor(env.root_states))
+    # # >>>>>>> 写死结束 <<<<<<<
+
     obs = env.get_observations()
     # load policy partial_checkpoint_load
     policy_cfg_dict = class_to_dict(train_cfg.policy)
@@ -63,12 +77,40 @@ def play(args):
                                                       **policy_cfg_dict)
     print(policy)
     #model_dict = torch.load(os.path.join(ROOT_DIR, 'model_4000_phase2_hip.pt'))
-    model_dict = torch.load(os.path.join(ROOT_DIR, 'model_10000.pt'))
+    model_dict = torch.load(os.path.join(ROOT_DIR, 'logs/rough_m2_constraint/Apr04_15-31-44_test_barlowtwins/model_2100.pt'))
     policy.load_state_dict(model_dict['model_state_dict'])
-    policy.half()
+    # policy.half()
     policy.eval()
     policy = policy.to(env.device)
     policy.save_torch_jit_policy('model.pt',env.device)
+
+    # =========================================================================
+    # 🌟 新增：全自动导出 ONNX 模型 (专为 BarlowTwins 盲走网络定制)
+    # =========================================================================
+    print("\n[*] 正在准备导出盲走网络的 ONNX 模型...")
+    
+    # 1. 剥离出专门用于真机部署的骨干网络 (注意这里的奇葩命名)
+    student_policy = policy.actor_teacher_backbone
+    student_policy.eval()
+    
+    # 2. 构造与真机严格对齐的虚拟输入 (剔除线速度后的 45维 单步 + 10帧历史)
+    dummy_obs = torch.randn(1, policy.num_prop - 3).to(env.device)
+    dummy_hist = torch.randn(1, policy.num_hist, policy.num_prop - 3).to(env.device)
+    
+    onnx_path = 'model.onnx'
+    
+    # 3. 执行导出
+    torch.onnx.export(
+        student_policy,
+        (dummy_obs, dummy_hist),       # 双输入口：当前观测值 + 历史观测值
+        onnx_path,
+        export_params=True,
+        opset_version=14,
+        input_names=['obs', 'hist'],   # C++ 端喂入数据时的节点名称
+        output_names=['action']        # C++ 端读取动作时的节点名称
+    )
+    print(f"[+] 恭喜！ONNX 模型已成功导出至当前目录: {onnx_path}\n")
+    # =========================================================================
 
     # clear images under frames folder
     # frames_path = os.path.join(ROOT_DIR, 'logs', train_cfg.runner.experiment_name, 'exported', 'frames')
@@ -108,11 +150,11 @@ def play(args):
         z_vel += torch.square(env.base_lin_vel[:, 2])
         xy_vel += torch.sum(torch.square(env.base_ang_vel[:, :2]), dim=1)
 
-        env.commands[:,0] = 1
+        env.commands[:,0] = 0.5
         env.commands[:,1] = 0
         env.commands[:,2] = 0
         env.commands[:,3] = 0
-        actions = policy.act_teacher(obs.half())
+        actions = policy.act_teacher(obs)
         # actions = torch.clamp(actions,-1.2,1.2)
 
         obs, privileged_obs, rewards,costs,dones, infos = env.step(actions)
@@ -135,11 +177,12 @@ def play(args):
     with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]) as prof:
          for i in range(1000):
             with torch.no_grad():
-              actions = policy.act_teacher(obs.half())
+              actions = policy.act_teacher(obs)
     print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=10))
 
 if __name__ == '__main__':
     task_registry.register("go2N3poHim",LeggedRobot,Go2ConstraintHimRoughCfg(),Go2ConstraintHimRoughCfgPPO())
+    task_registry.register("m2",LeggedRobot,M2ConstraintHimRoughCfg(),M2ConstraintHimRoughCfgPPO())
   
     RECORD_FRAMES = True
     args = get_args()
